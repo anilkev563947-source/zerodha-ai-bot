@@ -1,320 +1,100 @@
+import time
+import datetime
 import pandas as pd
 import yfinance as yf
+from kiteconnect import KiteConnect
 
-# ==========================================
-# NIFTY AI BOT - BACKTESTER
-# Version 4
-# Paper trading / backtesting only
-# ==========================================
+# --- ACCOUNT CONFIGURATION ---
+TOTAL_CAPITAL = 30000.0
+MAX_TRADE_RISK = 300.0       # Max loss per trade (1% of capital)
+MAX_DAILY_LOSS = -600.0      # Daily circuit breaker (2% of capital)
+DAILY_TARGET = 450.0         # Realistic daily profit target (1.5%)
 
-SYMBOL = "^NSEI"
-PERIOD = "2y"
-INTERVAL = "1d"
+# API Credentials
+API_KEY = "YOUR_API_KEY"
+API_SECRET = "YOUR_API_SECRET"
+REQUEST_TOKEN = "YOUR_REQUEST_TOKEN"
 
-STARTING_CAPITAL = 100000
+kite = KiteConnect(api_key=API_KEY)
+session = kite.generate_session(REQUEST_TOKEN, api_secret=API_SECRET)
+kite.set_access_token(session["access_token"])
 
-# Risk management
-RISK_PER_TRADE = 0.01       # 1% of capital
-ATR_STOP_MULTIPLIER = 1.5
-ATR_TARGET_MULTIPLIER = 3.0
+def calculate_quantity(current_price, stop_loss_points):
+    """Calculates share quantity so total trade risk stays <= ₹300."""
+    if stop_loss_points <= 0:
+        return 0
+    qty = int(MAX_TRADE_RISK / stop_loss_points)
+    # Ensure position size does not exceed maximum leverage capacity
+    max_allowed_qty = int((TOTAL_CAPITAL * 5) / current_price) 
+    return min(qty, max_allowed_qty)
 
-# Approximate trading cost for backtesting
-COST_PER_TRADE = 0.0005     # 0.05%
+def run_bot():
+    realized_pnl = 0.0
+    in_position = False
+    quantity = 0
+    
+    print(f"Bot initialized for ₹{TOTAL_CAPITAL} Capital. Monitoring markets...")
 
+    while True:
+        now = datetime.datetime.now().time()
 
-def calculate_indicators(data):
-
-    data = data.copy()
-
-    # Moving averages
-    data["SMA20"] = data["Close"].rolling(20).mean()
-    data["SMA50"] = data["Close"].rolling(50).mean()
-
-    # RSI
-    delta = data["Close"].diff()
-
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-
-    avg_gain = gain.rolling(14).mean()
-    avg_loss = loss.rolling(14).mean()
-
-    rs = avg_gain / avg_loss.replace(0, pd.NA)
-
-    data["RSI"] = 100 - (100 / (1 + rs))
-
-    # ATR
-    high_low = data["High"] - data["Low"]
-
-    high_close = (
-        data["High"] - data["Close"].shift(1)
-    ).abs()
-
-    low_close = (
-        data["Low"] - data["Close"].shift(1)
-    ).abs()
-
-    true_range = pd.concat(
-        [high_low, high_close, low_close],
-        axis=1
-    ).max(axis=1)
-
-    data["ATR"] = true_range.rolling(14).mean()
-
-    # ==========================================
-    # BUY CONDITION
-    # ==========================================
-    #
-    # 1. Short-term trend above long-term trend
-    # 2. RSI confirms positive momentum
-    #
-    data["BuySignal"] = (
-        (data["SMA20"] > data["SMA50"]) &
-        (data["RSI"] > 50) &
-        (data["RSI"] < 70)
-    )
-
-    # ==========================================
-    # EXIT CONDITION
-    # ==========================================
-
-    data["SellSignal"] = (
-        (data["SMA20"] < data["SMA50"]) |
-        (data["RSI"] < 45)
-    )
-
-    return data
-
-
-def backtest(data):
-
-    capital = STARTING_CAPITAL
-
-    position = 0
-    entry_price = 0
-
-    stop_loss = 0
-    target = 0
-
-    trades = []
-    equity_curve = []
-
-    for i in range(len(data)):
-
-        price = float(data["Close"].iloc[i])
-
-        buy_signal = bool(data["BuySignal"].iloc[i])
-        sell_signal = bool(data["SellSignal"].iloc[i])
-
-        atr = data["ATR"].iloc[i]
-
-        if pd.isna(atr):
-            equity_curve.append(capital)
+        # Execute only during standard Indian stock market hours (09:15 AM - 03:15 PM IST)
+        if not (datetime.time(9, 15) <= now <= datetime.time(15, 15)):
+            time.sleep(120)
             continue
 
-        atr = float(atr)
+        # Enforce Daily Risk Circuit Breaker
+        if realized_pnl <= MAX_DAILY_LOSS or realized_pnl >= DAILY_TARGET:
+            print(f"Daily Risk Limit reached. Net PnL: ₹{realized_pnl}. Halting bot.")
+            break
 
-        # ==========================================
-        # EXISTING POSITION
-        # ==========================================
+        try:
+            # Fetch 15-minute candle data for strategy indicators
+            df = yf.download("INFY.NS", period="5d", interval="15m")
+            df['EMA9'] = df['Close'].ewm(span=9, adjust=False).mean()
+            df['EMA21'] = df['Close'].ewm(span=21, adjust=False).mean()
 
-        if position > 0:
+            latest = df.iloc[-1]
+            price = float(latest['Close'])
+            ema9 = float(latest['EMA9'])
+            ema21 = float(latest['EMA21'])
 
-            # Stop loss
-            if price <= stop_loss:
-
-                exit_price = stop_loss
-
-                gross_profit = (
-                    exit_price - entry_price
-                ) * position
-
-                trading_cost = (
-                    entry_price * position * COST_PER_TRADE
-                    + exit_price * position * COST_PER_TRADE
-                )
-
-                profit = gross_profit - trading_cost
-
-                capital += profit
-
-                trades.append({
-                    "Entry": entry_price,
-                    "Exit": exit_price,
-                    "Quantity": position,
-                    "Profit": profit,
-                    "Reason": "ATR Stop Loss"
-                })
-
-                position = 0
-                entry_price = 0
-
-            # Target
-            elif price >= target:
-
-                exit_price = target
-
-                gross_profit = (
-                    exit_price - entry_price
-                ) * position
-
-                trading_cost = (
-                    entry_price * position * COST_PER_TRADE
-                    + exit_price * position * COST_PER_TRADE
-                )
-
-                profit = gross_profit - trading_cost
-
-                capital += profit
-
-                trades.append({
-                    "Entry": entry_price,
-                    "Exit": exit_price,
-                    "Quantity": position,
-                    "Profit": profit,
-                    "Reason": "ATR Target"
-                })
-
-                position = 0
-                entry_price = 0
-
-            # Strategy exit
-            elif sell_signal:
-
-                exit_price = price
-
-                gross_profit = (
-                    exit_price - entry_price
-                ) * position
-
-                trading_cost = (
-                    entry_price * position * COST_PER_TRADE
-                    + exit_price * position * COST_PER_TRADE
-                )
-
-                profit = gross_profit - trading_cost
-
-                capital += profit
-
-                trades.append({
-                    "Entry": entry_price,
-                    "Exit": exit_price,
-                    "Quantity": position,
-                    "Profit": profit,
-                    "Reason": "Strategy Exit"
-                })
-
-                position = 0
-                entry_price = 0
-
-        # ==========================================
-        # NEW BUY
-        # ==========================================
-
-        if position == 0 and buy_signal:
-
-            stop_distance = atr * ATR_STOP_MULTIPLIER
-            target_distance = atr * ATR_TARGET_MULTIPLIER
-
-            if stop_distance > 0:
-
-                risk_amount = capital * RISK_PER_TRADE
-
-                quantity = int(
-                    risk_amount / stop_distance
-                )
-
-                # Never use more capital than available
-                max_quantity = int(
-                    capital / price
-                )
-
-                quantity = min(
-                    quantity,
-                    max_quantity
-                )
-
+            # ENTRY SIGNAL: Fast EMA crosses above Slow EMA
+            if ema9 > ema21 and not in_position:
+                stop_loss_pts = price * 0.008 # 0.8% stop loss distance
+                quantity = calculate_quantity(price, stop_loss_pts)
+                
                 if quantity > 0:
-
-                    position = quantity
-                    entry_price = price
-
-                    stop_loss = (
-                        entry_price - stop_distance
+                    order = kite.place_order(
+                        variety=kite.VARIETY_REGULAR,
+                        exchange=kite.EXCHANGE_NSE,
+                        tradingsymbol="INFY",
+                        transaction_type=kite.TRANSACTION_TYPE_BUY,
+                        quantity=quantity,
+                        product=kite.PRODUCT_MIS,
+                        order_type=kite.ORDER_TYPE_MARKET
                     )
+                    in_position = True
+                    print(f"BUY Order Placed: Qty {quantity} at ₹{price}")
 
-                    target = (
-                        entry_price + target_distance
-                    )
+            # EXIT SIGNAL: Fast EMA crosses below Slow EMA
+            elif ema9 < ema21 and in_position:
+                order = kite.place_order(
+                    variety=kite.VARIETY_REGULAR,
+                    exchange=kite.EXCHANGE_NSE,
+                    tradingsymbol="INFY",
+                    transaction_type=kite.TRANSACTION_TYPE_SELL,
+                    quantity=quantity,
+                    product=kite.PRODUCT_MIS,
+                    order_type=kite.ORDER_TYPE_MARKET
+                )
+                in_position = False
+                print(f"SELL Order Placed: Qty {quantity} at ₹{price}")
 
-        # ==========================================
-        # EQUITY
-        # ==========================================
+        except Exception as err:
+            print(f"Execution Exception: {err}")
 
-        current_equity = capital
+        time.sleep(60) # Poll strategy every minute
 
-        if position > 0:
-
-            unrealized = (
-                price - entry_price
-            ) * position
-
-            current_equity += unrealized
-
-        equity_curve.append(current_equity)
-
-    # ==========================================
-    # CLOSE OPEN POSITION
-    # ==========================================
-
-    if position > 0:
-
-        final_price = float(
-            data["Close"].iloc[-1]
-        )
-
-        gross_profit = (
-            final_price - entry_price
-        ) * position
-
-        trading_cost = (
-            entry_price * position * COST_PER_TRADE
-            + final_price * position * COST_PER_TRADE
-        )
-
-        profit = gross_profit - trading_cost
-
-        capital += profit
-
-        trades.append({
-            "Entry": entry_price,
-            "Exit": final_price,
-            "Quantity": position,
-            "Profit": profit,
-            "Reason": "End of Backtest"
-        })
-
-    return capital, trades, equity_curve
-
-
-def print_results(capital, trades, equity_curve):
-
-    print("\n===================================")
-    print("        NIFTY VERSION 4")
-    print("===================================")
-
-    print(
-        f"Starting Capital : ₹{STARTING_CAPITAL:,.2f}"
-    )
-
-    print(
-        f"Final Capital    : ₹{capital:,.2f}"
-    )
-
-    total_profit = capital - STARTING_CAPITAL
-
-    print(
-        f"Total P/L        : ₹{total_profit:,.2f}"
-    )
-
-    return
+if __name__ == "__main__":
+    run_bot()
