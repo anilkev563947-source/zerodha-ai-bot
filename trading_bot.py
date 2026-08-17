@@ -1,46 +1,87 @@
 import pandas as pd
 import yfinance as yf
 
-# ==============================
+# ==========================================
 # NIFTY AI BOT - BACKTESTER
-# Version 3
+# Version 4
 # Paper trading / backtesting only
-# ==============================
+# ==========================================
 
-SYMBOL = "^NSEI"       # NIFTY 50
+SYMBOL = "^NSEI"
 PERIOD = "2y"
 INTERVAL = "1d"
 
 STARTING_CAPITAL = 100000
-RISK_PER_TRADE = 0.01     # 1% of capital
-STOP_LOSS_PCT = 0.01      # 1%
-TARGET_PCT = 0.02         # 2%
+
+# Risk management
+RISK_PER_TRADE = 0.01       # 1% of capital
+ATR_STOP_MULTIPLIER = 1.5
+ATR_TARGET_MULTIPLIER = 3.0
+
+# Approximate trading cost for backtesting
+COST_PER_TRADE = 0.0005     # 0.05%
 
 
-def calculate_strategy(data):
+def calculate_indicators(data):
+
     data = data.copy()
 
     # Moving averages
     data["SMA20"] = data["Close"].rolling(20).mean()
     data["SMA50"] = data["Close"].rolling(50).mean()
 
-    # Signal
-    data["Signal"] = 0
+    # RSI
+    delta = data["Close"].diff()
 
-    # BUY when SMA20 crosses above SMA50
-    buy_condition = (
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    avg_gain = gain.rolling(14).mean()
+    avg_loss = loss.rolling(14).mean()
+
+    rs = avg_gain / avg_loss.replace(0, pd.NA)
+
+    data["RSI"] = 100 - (100 / (1 + rs))
+
+    # ATR
+    high_low = data["High"] - data["Low"]
+
+    high_close = (
+        data["High"] - data["Close"].shift(1)
+    ).abs()
+
+    low_close = (
+        data["Low"] - data["Close"].shift(1)
+    ).abs()
+
+    true_range = pd.concat(
+        [high_low, high_close, low_close],
+        axis=1
+    ).max(axis=1)
+
+    data["ATR"] = true_range.rolling(14).mean()
+
+    # ==========================================
+    # BUY CONDITION
+    # ==========================================
+    #
+    # 1. Short-term trend above long-term trend
+    # 2. RSI confirms positive momentum
+    #
+    data["BuySignal"] = (
         (data["SMA20"] > data["SMA50"]) &
-        (data["SMA20"].shift(1) <= data["SMA50"].shift(1))
+        (data["RSI"] > 50) &
+        (data["RSI"] < 70)
     )
 
-    # SELL when SMA20 crosses below SMA50
-    sell_condition = (
-        (data["SMA20"] < data["SMA50"]) &
-        (data["SMA20"].shift(1) >= data["SMA50"].shift(1))
-    )
+    # ==========================================
+    # EXIT CONDITION
+    # ==========================================
 
-    data.loc[buy_condition, "Signal"] = 1
-    data.loc[sell_condition, "Signal"] = -1
+    data["SellSignal"] = (
+        (data["SMA20"] < data["SMA50"]) |
+        (data["RSI"] < 45)
+    )
 
     return data
 
@@ -48,6 +89,7 @@ def calculate_strategy(data):
 def backtest(data):
 
     capital = STARTING_CAPITAL
+
     position = 0
     entry_price = 0
 
@@ -55,15 +97,26 @@ def backtest(data):
     target = 0
 
     trades = []
+    equity_curve = []
 
     for i in range(len(data)):
 
         price = float(data["Close"].iloc[i])
-        signal = int(data["Signal"].iloc[i])
 
-        # =========================
-        # CHECK EXISTING POSITION
-        # =========================
+        buy_signal = bool(data["BuySignal"].iloc[i])
+        sell_signal = bool(data["SellSignal"].iloc[i])
+
+        atr = data["ATR"].iloc[i]
+
+        if pd.isna(atr):
+            equity_curve.append(capital)
+            continue
+
+        atr = float(atr)
+
+        # ==========================================
+        # EXISTING POSITION
+        # ==========================================
 
         if position > 0:
 
@@ -71,7 +124,17 @@ def backtest(data):
             if price <= stop_loss:
 
                 exit_price = stop_loss
-                profit = (exit_price - entry_price) * position
+
+                gross_profit = (
+                    exit_price - entry_price
+                ) * position
+
+                trading_cost = (
+                    entry_price * position * COST_PER_TRADE
+                    + exit_price * position * COST_PER_TRADE
+                )
+
+                profit = gross_profit - trading_cost
 
                 capital += profit
 
@@ -80,7 +143,7 @@ def backtest(data):
                     "Exit": exit_price,
                     "Quantity": position,
                     "Profit": profit,
-                    "Reason": "Stop Loss"
+                    "Reason": "ATR Stop Loss"
                 })
 
                 position = 0
@@ -90,7 +153,17 @@ def backtest(data):
             elif price >= target:
 
                 exit_price = target
-                profit = (exit_price - entry_price) * position
+
+                gross_profit = (
+                    exit_price - entry_price
+                ) * position
+
+                trading_cost = (
+                    entry_price * position * COST_PER_TRADE
+                    + exit_price * position * COST_PER_TRADE
+                )
+
+                profit = gross_profit - trading_cost
 
                 capital += profit
 
@@ -99,17 +172,27 @@ def backtest(data):
                     "Exit": exit_price,
                     "Quantity": position,
                     "Profit": profit,
-                    "Reason": "Target"
+                    "Reason": "ATR Target"
                 })
 
                 position = 0
                 entry_price = 0
 
-            # Strategy SELL signal
-            elif signal == -1:
+            # Strategy exit
+            elif sell_signal:
 
                 exit_price = price
-                profit = (exit_price - entry_price) * position
+
+                gross_profit = (
+                    exit_price - entry_price
+                ) * position
+
+                trading_cost = (
+                    entry_price * position * COST_PER_TRADE
+                    + exit_price * position * COST_PER_TRADE
+                )
+
+                profit = gross_profit - trading_cost
 
                 capital += profit
 
@@ -118,45 +201,88 @@ def backtest(data):
                     "Exit": exit_price,
                     "Quantity": position,
                     "Profit": profit,
-                    "Reason": "Sell Signal"
+                    "Reason": "Strategy Exit"
                 })
 
                 position = 0
                 entry_price = 0
 
-        # =========================
+        # ==========================================
         # NEW BUY
-        # =========================
+        # ==========================================
 
-        if position == 0 and signal == 1:
+        if position == 0 and buy_signal:
 
-            risk_amount = capital * RISK_PER_TRADE
+            stop_distance = atr * ATR_STOP_MULTIPLIER
+            target_distance = atr * ATR_TARGET_MULTIPLIER
 
-            risk_per_unit = price * STOP_LOSS_PCT
+            if stop_distance > 0:
 
-            if risk_per_unit > 0:
-                quantity = int(risk_amount / risk_per_unit)
+                risk_amount = capital * RISK_PER_TRADE
 
-            else:
-                quantity = 0
+                quantity = int(
+                    risk_amount / stop_distance
+                )
 
-            if quantity > 0:
+                # Never use more capital than available
+                max_quantity = int(
+                    capital / price
+                )
 
-                position = quantity
-                entry_price = price
+                quantity = min(
+                    quantity,
+                    max_quantity
+                )
 
-                stop_loss = entry_price * (1 - STOP_LOSS_PCT)
-                target = entry_price * (1 + TARGET_PCT)
+                if quantity > 0:
 
-    # =========================
+                    position = quantity
+                    entry_price = price
+
+                    stop_loss = (
+                        entry_price - stop_distance
+                    )
+
+                    target = (
+                        entry_price + target_distance
+                    )
+
+        # ==========================================
+        # EQUITY
+        # ==========================================
+
+        current_equity = capital
+
+        if position > 0:
+
+            unrealized = (
+                price - entry_price
+            ) * position
+
+            current_equity += unrealized
+
+        equity_curve.append(current_equity)
+
+    # ==========================================
     # CLOSE OPEN POSITION
-    # =========================
+    # ==========================================
 
     if position > 0:
 
-        final_price = float(data["Close"].iloc[-1])
+        final_price = float(
+            data["Close"].iloc[-1]
+        )
 
-        profit = (final_price - entry_price) * position
+        gross_profit = (
+            final_price - entry_price
+        ) * position
+
+        trading_cost = (
+            entry_price * position * COST_PER_TRADE
+            + final_price * position * COST_PER_TRADE
+        )
+
+        profit = gross_profit - trading_cost
 
         capital += profit
 
@@ -168,95 +294,27 @@ def backtest(data):
             "Reason": "End of Backtest"
         })
 
-    return capital, trades
+    return capital, trades, equity_curve
 
 
-def print_results(capital, trades):
+def print_results(capital, trades, equity_curve):
 
-    print("\n==============================")
-    print("       NIFTY BACKTEST")
-    print("==============================")
+    print("\n===================================")
+    print("        NIFTY VERSION 4")
+    print("===================================")
 
-    print(f"Starting Capital : ₹{STARTING_CAPITAL:,.2f}")
-    print(f"Final Capital    : ₹{capital:,.2f}")
+    print(
+        f"Starting Capital : ₹{STARTING_CAPITAL:,.2f}"
+    )
+
+    print(
+        f"Final Capital    : ₹{capital:,.2f}"
+    )
 
     total_profit = capital - STARTING_CAPITAL
 
-    print(f"Total P/L        : ₹{total_profit:,.2f}")
-
-    if STARTING_CAPITAL > 0:
-        return_pct = (total_profit / STARTING_CAPITAL) * 100
-    else:
-        return_pct = 0
-
-    print(f"Return           : {return_pct:.2f}%")
-
-    print(f"Total Trades     : {len(trades)}")
-
-    if len(trades) > 0:
-
-        winning_trades = [
-            trade for trade in trades
-            if trade["Profit"] > 0
-        ]
-
-        losing_trades = [
-            trade for trade in trades
-            if trade["Profit"] <= 0
-        ]
-
-        win_rate = (
-            len(winning_trades) / len(trades)
-        ) * 100
-
-        print(f"Winning Trades   : {len(winning_trades)}")
-        print(f"Losing Trades    : {len(losing_trades)}")
-        print(f"Win Rate         : {win_rate:.2f}%")
-
-        print("\nRecent Trades:")
-        print("------------------------------")
-
-        for trade in trades[-10:]:
-
-            print(
-                f"Entry ₹{trade['Entry']:.2f} | "
-                f"Exit ₹{trade['Exit']:.2f} | "
-                f"Qty {trade['Quantity']} | "
-                f"P/L ₹{trade['Profit']:.2f} | "
-                f"{trade['Reason']}"
-            )
-
-
-def main():
-
-    print("Downloading NIFTY 50 data...")
-
-    data = yf.download(
-        SYMBOL,
-        period=PERIOD,
-        interval=INTERVAL,
-        auto_adjust=True,
-        progress=False
+    print(
+        f"Total P/L        : ₹{total_profit:,.2f}"
     )
 
-    if data.empty:
-        print("ERROR: Could not download market data.")
-        return
-
-    # Handle Yahoo Finance MultiIndex columns
-    if isinstance(data.columns, pd.MultiIndex):
-        data.columns = data.columns.get_level_values(0)
-
-    data = data.dropna()
-
-    print(f"Downloaded {len(data)} candles.")
-
-    data = calculate_strategy(data)
-
-    capital, trades = backtest(data)
-
-    print_results(capital, trades)
-
-
-if __name__ == "__main__":
-    main()
+    return
