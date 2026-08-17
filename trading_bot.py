@@ -4,24 +4,19 @@ import yfinance as yf
 # --- BACKTEST CONFIGURATION ---
 TOTAL_CAPITAL = 30000.0
 MAX_TRADE_RISK = 300.0  # Max risk per trade (1%)
+RISK_REWARD_RATIO = 2.0  # 1:2 Risk-to-Reward Ratio
 SYMBOLS = ["INFY.NS", "TCS.NS", "RELIANCE.NS", "HDFCBANK.NS", "ICICIBANK.NS"]
 
-def calculate_quantity(price, stop_loss_pts):
-    if stop_loss_pts <= 0:
+def calculate_quantity(entry_price, stop_loss_price):
+    risk_per_share = abs(entry_price - stop_loss_price)
+    if risk_per_share <= 0:
         return 0
-    qty = int(MAX_TRADE_RISK / stop_loss_pts)
-    max_allowed = int((TOTAL_CAPITAL * 5) / price)
+    qty = int(MAX_TRADE_RISK / risk_per_share)
+    max_allowed = int((TOTAL_CAPITAL * 5) / entry_price)
     return min(qty, max_allowed)
 
-def calculate_rsi(series, period=14):
-    delta = series.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    rs = gain / loss
-    return 100 - (100 / (1 + rs))
-
-def backtest_single_stock(symbol):
-    print(f"\n--- Testing {symbol} ---")
+def backtest_orb_strategy(symbol):
+    print(f"\n--- Testing Price Action Breakout (1:2 RR) on {symbol} ---")
     df = yf.download(symbol, period="1mo", interval="15m", auto_adjust=True)
     if df.empty:
         print(f"❌ Could not fetch data for {symbol}")
@@ -30,59 +25,70 @@ def backtest_single_stock(symbol):
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
 
-    df['EMA9'] = df['Close'].ewm(span=9, adjust=False).mean()
-    df['EMA21'] = df['Close'].ewm(span=21, adjust=False).mean()
-    df['RSI'] = calculate_rsi(df['Close'], period=14)
-
-    in_position = False
-    buy_price = 0.0
-    trailing_sl = 0.0
-    qty = 0
+    # Add Date column to identify daily session boundaries
+    df['Date'] = df.index.date
     trades = []
 
-    for i in range(14, len(df)):
-        prev_row = df.iloc[i - 1]
-        curr_row = df.iloc[i]
+    # Iterate through each trading day individually
+    for trade_date, group in df.groupby('Date'):
+        if len(group) < 4:  # Skip incomplete days
+            continue
 
-        prev_ema9 = float(prev_row['EMA9'].iloc[0]) if isinstance(prev_row['EMA9'], pd.Series) else float(prev_row['EMA9'])
-        prev_ema21 = float(prev_row['EMA21'].iloc[0]) if isinstance(prev_row['EMA21'], pd.Series) else float(prev_row['EMA21'])
-        curr_ema9 = float(curr_row['EMA9'].iloc[0]) if isinstance(curr_row['EMA9'], pd.Series) else float(curr_row['EMA9'])
-        curr_ema21 = float(curr_row['EMA21'].iloc[0]) if isinstance(curr_row['EMA21'], pd.Series) else float(curr_row['EMA21'])
-        
-        price = float(curr_row['Close'].iloc[0]) if isinstance(curr_row['Close'], pd.Series) else float(curr_row['Close'])
-        rsi = float(curr_row['RSI'].iloc[0]) if isinstance(curr_row['RSI'], pd.Series) else float(curr_row['RSI'])
+        # Opening Range: First 15-minute candle of the day
+        orb_candle = group.iloc[0]
+        orb_high = float(orb_candle['High'].iloc[0]) if isinstance(orb_candle['High'], pd.Series) else float(orb_candle['High'])
+        orb_low = float(orb_candle['Low'].iloc[0]) if isinstance(orb_candle['Low'], pd.Series) else float(orb_candle['Low'])
 
-        if in_position:
-            new_sl = price * (1 - 0.008)
-            if new_sl > trailing_sl:
-                trailing_sl = new_sl
+        in_position = False
+        buy_price = 0.0
+        stop_loss = 0.0
+        target_price = 0.0
+        qty = 0
 
-            if price <= trailing_sl or (prev_ema9 >= prev_ema21 and curr_ema9 < curr_ema21):
-                pnl = (price - buy_price) * qty
-                trades.append(pnl)
-                in_position = False
-                continue
+        # Evaluate the rest of the day's candles
+        for i in range(1, len(group)):
+            curr_row = group.iloc[i]
+            high = float(curr_row['High'].iloc[0]) if isinstance(curr_row['High'], pd.Series) else float(curr_row['High'])
+            low = float(curr_row['Low'].iloc[0]) if isinstance(curr_row['Low'], pd.Series) else float(curr_row['Low'])
+            close = float(curr_row['Close'].iloc[0]) if isinstance(curr_row['Close'], pd.Series) else float(curr_row['Close'])
 
-        if prev_ema9 <= prev_ema21 and curr_ema9 > curr_ema21 and rsi > 50 and not in_position:
-            stop_loss_pts = price * 0.008
-            qty = calculate_quantity(price, stop_loss_pts)
-            if qty > 0:
-                buy_price = price
-                trailing_sl = price - stop_loss_pts
-                in_position = True
+            # MANAGEMENT: Check Target or Stop-Loss if in trade
+            if in_position:
+                if high >= target_price:  # 🎯 TAKE PROFIT HIT
+                    pnl = (target_price - buy_price) * qty
+                    trades.append(pnl)
+                    in_position = False
+                    break
+                elif low <= stop_loss:  # 🛑 STOP LOSS HIT
+                    pnl = (stop_loss - buy_price) * qty
+                    trades.append(pnl)
+                    in_position = False
+                    break
+
+            # ENTRY: Breakout above Opening Range High
+            elif close > orb_high and not in_position:
+                buy_price = close
+                stop_loss = orb_low
+                risk_per_share = buy_price - stop_loss
+
+                if risk_per_share > 0:
+                    qty = calculate_quantity(buy_price, stop_loss)
+                    if qty > 0:
+                        target_price = buy_price + (risk_per_share * RISK_REWARD_RATIO)
+                        in_position = True
 
     pnl_sum = sum(trades)
-    print(f"Trades: {len(trades)} | PnL: ₹{pnl_sum:.2f}")
+    print(f"Trades: {len(trades)} | Net PnL: ₹{pnl_sum:.2f}")
     return trades
 
-def run_multi_stock_backtest():
+def run_price_action_backtest():
     print("==========================================")
-    print("   MULTI-STOCK BASKET BACKTEST (30 DAYS)  ")
+    print("  OPENING RANGE BREAKOUT (1:2 R:R) BACKTEST")
     print("==========================================")
     
     all_trades = []
     for symbol in SYMBOLS:
-        trades = backtest_single_stock(symbol)
+        trades = backtest_orb_strategy(symbol)
         all_trades.extend(trades)
 
     total_trades = len(all_trades)
@@ -91,7 +97,7 @@ def run_multi_stock_backtest():
     win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
 
     print("\n==========================================")
-    print("      OVERALL BASKET BACKTEST SUMMARY     ")
+    print("     PRICE ACTION BASKET SUMMARY           ")
     print("==========================================")
     print(f"Total Stocks Tested   : {len(SYMBOLS)}")
     print(f"Total Trades Executed : {total_trades}")
@@ -101,4 +107,4 @@ def run_multi_stock_backtest():
     print("==========================================")
 
 if __name__ == "__main__":
-    run_multi_stock_backtest()
+    run_price_action_backtest()
