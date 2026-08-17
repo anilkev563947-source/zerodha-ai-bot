@@ -3,11 +3,10 @@ import datetime
 import pandas as pd
 import yfinance as yf
 
-# --- PAPER TRADING CONFIGURATION ---
 TOTAL_CAPITAL = 30000.0
-MAX_TRADE_RISK = 300.0       # Risk capped at ₹300 per trade (1% of capital)
-MAX_DAILY_LOSS = -600.0      # Hard stop if daily loss reaches ₹600 (2%)
-DAILY_TARGET = 450.0         # Daily profit target cap (1.5%)
+MAX_TRADE_RISK = 300.0
+MAX_DAILY_LOSS = -600.0
+DAILY_TARGET = 450.0
 
 def calculate_quantity(current_price, stop_loss_points):
     if stop_loss_points <= 0:
@@ -27,24 +26,28 @@ def run_paper_trading_bot():
     print(f"   Capital: ₹{TOTAL_CAPITAL} | Risk/Trade: ₹{MAX_TRADE_RISK}")
     print("==========================================\n")
 
-    # Fetch 15-minute candle data for Infosys (NSE)
-    df = yf.download("INFY.NS", period="5d", interval="15m")
+    # Fetch data and auto-adjust MultiIndex columns
+    df = yf.download("INFY.NS", period="5d", interval="15m", auto_adjust=True)
     if df.empty:
         print("❌ Error fetching market data from Yahoo Finance.")
         return
 
-    # Calculate strategy technical indicators
+    # Flatten MultiIndex columns if present
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+
+    # Calculate indicators
     df['EMA9'] = df['Close'].ewm(span=9, adjust=False).mean()
     df['EMA21'] = df['Close'].ewm(span=21, adjust=False).mean()
 
+    # Extract scalar float values safely
     latest = df.iloc[-1]
-    price = float(latest['Close'])
-    ema9 = float(latest['EMA9'])
-    ema21 = float(latest['EMA21'])
+    price = float(latest['Close'].iloc[0]) if isinstance(latest['Close'], pd.Series) else float(latest['Close'])
+    ema9 = float(latest['EMA9'].iloc[0]) if isinstance(latest['EMA9'], pd.Series) else float(latest['EMA9'])
+    ema21 = float(latest['EMA21'].iloc[0]) if isinstance(latest['EMA21'], pd.Series) else float(latest['EMA21'])
 
     print(f"📊 Market Check: INFY Price = ₹{price:.2f} | EMA9 = {ema9:.2f} | EMA21 = {ema21:.2f}")
 
-    # BUY SIGNAL (Fast EMA crosses above Slow EMA)
     if ema9 > ema21 and not in_position:
         stop_loss_pts = price * 0.008
         quantity = calculate_quantity(price, stop_loss_pts)
@@ -53,9 +56,7 @@ def run_paper_trading_bot():
         print(f"🟢 [BUY SIGNAL] Paper Trade Executed:")
         print(f"    - Quantity: {quantity} shares")
         print(f"    - Execution Price: ₹{price:.2f}")
-        print(f"    - Simulated Investment: ₹{quantity * price:.2f}")
 
-    # SELL SIGNAL (Fast EMA crosses below Slow EMA)
     elif ema9 < ema21 and in_position:
         pnl = (price - buy_price) * quantity
         realized_pnl += pnl
@@ -63,7 +64,6 @@ def run_paper_trading_bot():
         print(f"🔴 [SELL SIGNAL] Paper Trade Executed:")
         print(f"    - Exit Price: ₹{price:.2f}")
         print(f"    - Trade PnL: ₹{pnl:.2f}")
-        print(f"    - Net Realized PnL: ₹{realized_pnl:.2f}")
 
     else:
         print("ℹ️ No crossover signal detected on current candle. Holding status.")
