@@ -1,2 +1,3 @@
+kiteconnect
 pandas
 yfinance
