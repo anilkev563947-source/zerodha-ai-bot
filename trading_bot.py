@@ -4,6 +4,7 @@ import yfinance as yf
 # --- BACKTEST CONFIGURATION ---
 TOTAL_CAPITAL = 30000.0
 MAX_TRADE_RISK = 300.0  # Max risk per trade (1%)
+SYMBOLS = ["INFY.NS", "TCS.NS", "RELIANCE.NS", "HDFCBANK.NS", "ICICIBANK.NS"]
 
 def calculate_quantity(price, stop_loss_pts):
     if stop_loss_pts <= 0:
@@ -19,22 +20,16 @@ def calculate_rsi(series, period=14):
     rs = gain / loss
     return 100 - (100 / (1 + rs))
 
-def run_improved_backtest():
-    print("==========================================")
-    print("   ENHANCED BACKTEST (EMA + RSI + TSL)    ")
-    print(f"   Capital: ₹{TOTAL_CAPITAL} | Risk/Trade: ₹{MAX_TRADE_RISK}")
-    print("==========================================\n")
-
-    # Fetch 30 days of 15-minute candles for INFY
-    df = yf.download("INFY.NS", period="1mo", interval="15m", auto_adjust=True)
+def backtest_single_stock(symbol):
+    print(f"\n--- Testing {symbol} ---")
+    df = yf.download(symbol, period="1mo", interval="15m", auto_adjust=True)
     if df.empty:
-        print("❌ Error fetching historical market data.")
-        return
+        print(f"❌ Could not fetch data for {symbol}")
+        return []
 
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
 
-    # Calculate Indicators
     df['EMA9'] = df['Close'].ewm(span=9, adjust=False).mean()
     df['EMA21'] = df['Close'].ewm(span=21, adjust=False).mean()
     df['RSI'] = calculate_rsi(df['Close'], period=14)
@@ -57,23 +52,17 @@ def run_improved_backtest():
         price = float(curr_row['Close'].iloc[0]) if isinstance(curr_row['Close'], pd.Series) else float(curr_row['Close'])
         rsi = float(curr_row['RSI'].iloc[0]) if isinstance(curr_row['RSI'], pd.Series) else float(curr_row['RSI'])
 
-        # POSITION MANAGEMENT (TRAILING STOP LOSS)
         if in_position:
-            # Update trailing stop loss if price moves higher (0.8% below current price)
             new_sl = price * (1 - 0.008)
             if new_sl > trailing_sl:
                 trailing_sl = new_sl
 
-            # EXIT: Trailing Stop Loss hit OR EMA Bearish Crossover
             if price <= trailing_sl or (prev_ema9 >= prev_ema21 and curr_ema9 < curr_ema21):
                 pnl = (price - buy_price) * qty
                 trades.append(pnl)
                 in_position = False
-                reason = "TSL HIT" if price <= trailing_sl else "EMA SELL"
-                print(f"🔴 [{reason}] Date: {df.index[i]} | Price: ₹{price:.2f} | PnL: ₹{pnl:.2f}")
                 continue
 
-        # ENTRY: EMA Bullish Crossover AND RSI > 50 Filter
         if prev_ema9 <= prev_ema21 and curr_ema9 > curr_ema21 and rsi > 50 and not in_position:
             stop_loss_pts = price * 0.008
             qty = calculate_quantity(price, stop_loss_pts)
@@ -81,22 +70,35 @@ def run_improved_backtest():
                 buy_price = price
                 trailing_sl = price - stop_loss_pts
                 in_position = True
-                print(f"🟢 [BUY] Date: {df.index[i]} | Price: ₹{price:.2f} | RSI: {rsi:.1f} | Qty: {qty}")
 
-    # Performance Metrics
-    total_pnl = sum(trades)
-    winning_trades = len([t for t in trades if t > 0])
-    total_trades = len(trades)
+    pnl_sum = sum(trades)
+    print(f"Trades: {len(trades)} | PnL: ₹{pnl_sum:.2f}")
+    return trades
+
+def run_multi_stock_backtest():
+    print("==========================================")
+    print("   MULTI-STOCK BASKET BACKTEST (30 DAYS)  ")
+    print("==========================================")
+    
+    all_trades = []
+    for symbol in SYMBOLS:
+        trades = backtest_single_stock(symbol)
+        all_trades.extend(trades)
+
+    total_trades = len(all_trades)
+    winning_trades = len([t for t in all_trades if t > 0])
+    total_pnl = sum(all_trades)
     win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
 
     print("\n==========================================")
-    print("       ENHANCED BACKTEST SUMMARY          ")
+    print("      OVERALL BASKET BACKTEST SUMMARY     ")
     print("==========================================")
+    print(f"Total Stocks Tested   : {len(SYMBOLS)}")
     print(f"Total Trades Executed : {total_trades}")
     print(f"Winning Trades        : {winning_trades}")
-    print(f"Win Rate              : {win_rate:.2f}%")
-    print(f"Net Realized PnL      : ₹{total_pnl:.2f}")
+    print(f"Overall Win Rate      : {win_rate:.2f}%")
+    print(f"Total Basket PnL      : ₹{total_pnl:.2f}")
     print("==========================================")
 
 if __name__ == "__main__":
-    run_improved_backtest()
+    run_multi_stock_backtest()
